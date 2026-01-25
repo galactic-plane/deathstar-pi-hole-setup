@@ -486,5 +486,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **May the force be with your network security!**
-
-For support, issues, or feature requests, please visit the [GitHub repository](https://github.com/galactic-plane/deathstar-pi-hole-setup).
