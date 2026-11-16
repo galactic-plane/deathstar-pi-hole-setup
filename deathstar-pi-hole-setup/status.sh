@@ -367,7 +367,8 @@ check_installation_status() {
         if dpkg -l | grep -q "^ii.*iotop"; then
             iotop_status="✅ INSTALLED"
             # Check if we can access the binary (without sudo)
-            if command_exists iotop; then
+            # iotop lives in /usr/sbin, which is not on every user's PATH
+            if command_exists iotop || [[ -x /usr/sbin/iotop ]]; then
                 iotop_health="🟢 HEALTHY"
                 iotop_notes="I/O monitor (use with sudo for full functionality)"
             else
@@ -1140,7 +1141,10 @@ check_security_and_tailscale() {
         routes=$(echo "${prefs}" | python3 -c 'import json,sys; print(", ".join(json.load(sys.stdin).get("AdvertiseRoutes") or []))' 2>/dev/null || true)
         if [[ -n "${routes}" ]]; then
             print_status "Advertised routes: ${routes}"
-            if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]; then
+            # Read the kernel setting directly (sysctl is in /usr/sbin, not always on PATH)
+            local ip_forward=""
+            ip_forward=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || true)
+            if [[ "${ip_forward}" == "1" ]]; then
                 print_success "IP forwarding is enabled for subnet routing / exit node"
             else
                 print_warning "Routes are advertised but IP forwarding is off"
