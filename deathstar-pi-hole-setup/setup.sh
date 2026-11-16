@@ -98,6 +98,16 @@ if [[ -f "${SCRIPT_DIR}/lib/config_loader.sh" ]]; then
     source "${SCRIPT_DIR}/lib/config_loader.sh"
 fi
 
+# Load stack hardening helpers (passwords in .env files, Pi-hole settings,
+# playbook lock). Required: setup cannot store passwords safely without it.
+if [[ -f "${SCRIPT_DIR}/lib/stack_hardening.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/lib/stack_hardening.sh"
+else
+    echo "Error: ${SCRIPT_DIR}/lib/stack_hardening.sh is missing - re-run push_to_pi.sh" >&2
+    exit 1
+fi
+
 # Set default values if config_loader.sh didn't set them
 : "${DS_STATE_FILE:=${HOME}/.deathstar_setup_state}"
 : "${DS_CONFIG_FILE:=${HOME}/.deathstar_config}"
@@ -112,6 +122,11 @@ fi
 : "${LOG_ERROR_FILE:=${HOME}/.deathstar_setup_error.log}"
 : "${LOG_DEBUG_FILE:=${HOME}/.deathstar_setup_debug.log}"
 : "${DRY_RUN:=0}"
+
+# Where the Pi-hole admin password is kept (see lib/stack_hardening.sh)
+PIHOLE_ENV_FILE="${DS_CONFIG_DIR:-${HOME}}/pi-hole/.env"
+# Grafana's container name (Compose project "internet-monitoring")
+GRAFANA_CONTAINER="internet-monitoring-grafana-1"
 
 # Colors for output
 RED='\033[0;31m'
@@ -214,9 +229,11 @@ STATES=(
     "CONFIG_GENERATION"
     "ANSIBLE_PLAYBOOK"
     "CONTAINER_DEPLOYMENT"
+    "STACK_HARDENING"
     "PADD_INSTALL"
     "VERIFICATION"
     "HARDENING"
+    "TAILSCALE_SETUP"
     "CLEANUP"
     "COMPLETE"
 )
@@ -1327,13 +1344,45 @@ secure_password_input() {
         read -r -s -p "Confirm password: " password_confirm
         echo
         
-        if [[ "${password}" == "${password_confirm}" ]]; then
+        if [[ "${password}" != "${password_confirm}" ]]; then
+            echo -e "${RED}Passwords do not match. Please try again.${NC}"
+        elif ! ds_password_is_valid "${password}"; then
+            echo -e "${RED}Passwords cannot contain a single quote ('). Please try again.${NC}"
+        else
             SECURE_PASSWORD="${password}"
             return 0
-        else
-            echo -e "${RED}Passwords do not match. Please try again.${NC}"
         fi
     done
+}
+
+#===============================================================================
+# Function: collect_grafana_password
+# Description: Ask for Grafana's admin password (blank = random). It is only
+#              needed for Grafana's first start; afterwards Grafana keeps a
+#              hashed copy and the plain-text copies are deleted.
+# Sets: GRAFANA_ADMIN_PASSWORD
+#===============================================================================
+collect_grafana_password() {
+    echo "Enter a Grafana admin password (leave blank for random)."
+    echo "Use a different password from Pi-hole. It is only kept on disk until Grafana's first start."
+    while true; do
+        secure_password_input "Grafana password"
+        # internet-pi writes it into a Docker env file, where Compose would
+        # treat a "$" as the start of a variable and mangle the password
+        if [[ "${SECURE_PASSWORD}" == *'$'* ]]; then
+            echo -e "${RED}The Grafana password cannot contain a dollar sign (\$). Please try again.${NC}"
+            continue
+        fi
+        break
+    done
+    if [[ -z "${SECURE_PASSWORD}" ]]; then
+        GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 12)
+        echo "Generated random Grafana password: ${GRAFANA_ADMIN_PASSWORD}"
+        echo "(Write it down now - it will not be stored once Grafana has started)"
+    else
+        GRAFANA_ADMIN_PASSWORD="${SECURE_PASSWORD}"
+        echo "Grafana password confirmed"
+    fi
 }
 
 # User interaction functions
@@ -1342,13 +1391,6 @@ collect_user_preferences() {
         print_status "Loading existing configuration..."
         # shellcheck disable=SC1090
         source "${CONFIG_FILE}"
-        
-        # Generate password hash if not already present and password exists
-        if [[ -n "${PIHOLE_PASSWORD}" && -z "${PIHOLE_PASSWORD_HASH}" ]]; then
-            PIHOLE_PASSWORD_HASH=$(echo -n "${PIHOLE_PASSWORD}" | sha256sum | awk '{print $1}' | sha256sum | awk '{print $1}')
-            echo "Password hash generated from existing password"
-        fi
-        
         return 0
     fi
     
@@ -1367,22 +1409,41 @@ collect_user_preferences() {
         if [[ -z "${SECURE_PASSWORD}" ]]; then
             PIHOLE_PASSWORD=$(openssl rand -base64 12)
             echo "Generated random password: ${PIHOLE_PASSWORD}"
+            echo "(Write it down - it is also saved in ${PIHOLE_ENV_FILE})"
         else
             PIHOLE_PASSWORD="${SECURE_PASSWORD}"
             echo "Password confirmed successfully"
         fi
         
-        # Generate password hash for Pi-hole (double SHA256)
-        PIHOLE_PASSWORD_HASH=$(echo -n "${PIHOLE_PASSWORD}" | sha256sum | awk '{print $1}' | sha256sum | awk '{print $1}')
-        echo "Password hash generated for Pi-hole configuration"
+        # Store the password in ~/pi-hole/.env (mode 600). It is never written
+        # to docker-compose.yml, config.yml, or ~/.deathstar_config.
+        if ! ds_write_env_password "${PIHOLE_PASSWORD}"; then
+            print_error "Could not save the password to ${PIHOLE_ENV_FILE}"
+            exit 1
+        fi
+        print_success "Password saved to ${PIHOLE_ENV_FILE} (mode 600)"
     fi
     
     # Monitoring services
     read -r -p "Enable internet speed monitoring? (Y/n): " ENABLE_MONITORING
     ENABLE_MONITORING=${ENABLE_MONITORING:-Y}
     
+    if [[ "${ENABLE_MONITORING^^}" == "Y" ]]; then
+        collect_grafana_password
+    fi
+    
     read -r -p "Enable Shelly plug monitoring? (y/N): " ENABLE_SHELLY
     ENABLE_SHELLY=${ENABLE_SHELLY:-N}
+    
+    SHELLY_HOSTNAME=""
+    SHELLY_USERNAME=""
+    if [[ "${ENABLE_SHELLY^^}" == "Y" ]]; then
+        read -r -p "Shelly plug hostname or IP address: " SHELLY_HOSTNAME
+        read -r -p "Shelly plug HTTP username (blank if login is off): " SHELLY_USERNAME
+        echo "Shelly plug HTTP password (blank if login is off)"
+        secure_password_input "Shelly password"
+        SHELLY_HTTP_PASSWORD="${SECURE_PASSWORD}"
+    fi
     
     read -r -p "Enable AirGradient monitoring? (y/N): " ENABLE_AIRGRADIENT
     ENABLE_AIRGRADIENT=${ENABLE_AIRGRADIENT:-N}
@@ -1393,19 +1454,21 @@ collect_user_preferences() {
     # Confirm user choices
     confirm_user_choices
     
-    # Save configuration (store hash only, not plain password for security)
+    # Save configuration (no password: that lives only in ~/pi-hole/.env)
     cat > "${CONFIG_FILE}" << EOF
 # Death Star Pi-hole Configuration
 ENABLE_PIHOLE="${ENABLE_PIHOLE^^}"
-PIHOLE_PASSWORD_HASH="${PIHOLE_PASSWORD_HASH}"
 ENABLE_MONITORING="${ENABLE_MONITORING^^}"
 ENABLE_SHELLY="${ENABLE_SHELLY^^}"
+SHELLY_HOSTNAME="${SHELLY_HOSTNAME}"
+SHELLY_USERNAME="${SHELLY_USERNAME}"
 ENABLE_AIRGRADIENT="${ENABLE_AIRGRADIENT^^}"
 ENABLE_STARLINK="${ENABLE_STARLINK^^}"
 GENERATED_DATE="$(date || true)"
 GENERATED_DATE="${GENERATED_DATE:-Unknown}"
-# Note: Plain password not stored for security reasons
-# Password can be regenerated if needed using the hash
+# Note: no passwords are stored here. Pi-hole's lives in ~/pi-hole/.env,
+# Shelly's in ~/shelly-plug-prometheus/.env, and Grafana keeps its own
+# hashed copy after its first start.
 EOF
     
     # Set restrictive permissions on config file
@@ -1426,146 +1489,84 @@ generate_ansible_config() {
     # shellcheck disable=SC1090
     source "${CONFIG_FILE}"
     
-    # Ensure password hash is available
-    if [[ -n "${PIHOLE_PASSWORD}" && -z "${PIHOLE_PASSWORD_HASH}" ]]; then
-        PIHOLE_PASSWORD_HASH=$(echo -n "${PIHOLE_PASSWORD}" | sha256sum | awk '{print $1}' | sha256sum | awk '{print $1}')
-    fi
-    
     local repo_dir="${DS_INTERNET_PI_DIR}"
     local config_file="${repo_dir}/config.yml"
-    
-    # Detect Pi IP address
-    local pi_ip
-    pi_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    if [[ -z "${pi_ip}" ]]; then
-        print_error "Could not automatically detect Pi IP address"
-        print_error "Please ensure your Pi has a valid network connection and IP address"
-        print_error "You can check your IP with: hostname -I"
-        print_error "Or configure a static IP in your router/network settings"
-        exit 1
-    else
-        print_status "Detected Pi IP address: ${pi_ip}"
-    fi
     
     # Get system timezone
     local system_timezone
     system_timezone=$(get_timezone)
     print_status "Detected system timezone: ${system_timezone}"
     
-    # Generate config.yml based on user preferences
-    cat > "${config_file}" << EOF
----
-# Death Star Pi Configuration - Generated by Death Star Setup
-
-# Network Configuration
-internet_pi_ip: "${pi_ip}"
-internet_pi_ipv6: ""
-internet_pi_hostname: "${DS_NEW_HOSTNAME}"
-internet_pi_domain: "${DS_DOMAIN_NAME}"
-
-# Security Configuration  
-internet_pi_password_hash: "${PIHOLE_PASSWORD_HASH}"
-EOF
-
-    # Pi-hole Configuration
-    local _pihole_enable
+    # Pi-hole's password lives only in ~/pi-hole/.env. config.yml passes the
+    # literal text ${PIHOLE_PASSWORD} to the Pi-hole template, and Docker
+    # Compose fills in the real value from .env when it starts the stack.
     if [[ "${ENABLE_PIHOLE}" == "Y" ]]; then
-        _pihole_enable="true"
-    else
-        _pihole_enable="false"
-    fi
-    echo "internet_pi_pihole_enable: ${_pihole_enable}" >> "${config_file}"
-
-    # Add Pi-hole password if Pi-hole is enabled
-    if [[ "${ENABLE_PIHOLE}" == "Y" ]]; then
-        cat >> "${config_file}" << EOF
-# Pi-hole uses plain text password (not hash) for FTLCONF_webserver_api_password
-pihole_password: "${PIHOLE_PASSWORD}"
-EOF
-    fi
-
-    # Continue with the rest of the config
-    # Docker Configuration
-    cat >> "${config_file}" << EOF
-
-internet_pi_enable_docker_health_monitor: true
-EOF
-
-    # Internet Monitoring Configuration
-    local _monitoring_enable
-    if [[ "${ENABLE_MONITORING}" == "Y" ]]; then
-        _monitoring_enable="true"
-    else
-        _monitoring_enable="false"
-    fi
-    cat >> "${config_file}" << EOF
-internet_pi_enable_internet_monitoring: ${_monitoring_enable}
-EOF
-
-    # Add Grafana password if monitoring is enabled
-    if [[ "${ENABLE_MONITORING}" == "Y" ]]; then
-        cat >> "${config_file}" << EOF
-# Grafana uses plain text password (not hash) for GF_SECURITY_ADMIN_PASSWORD
-monitoring_grafana_admin_password: "${PIHOLE_PASSWORD}"
-EOF
-    fi
-
-    # Shelly Plug Configuration
-    local _shelly_enable
-    if [[ "${ENABLE_SHELLY}" == "Y" ]]; then
-        _shelly_enable="true"
-    else
-        _shelly_enable="false"
+        local pihole_dir
+        pihole_dir=$(ds_pihole_dir)
+        if ! ds_env_ensure "${pihole_dir}" "PIHOLE_PASSWORD" "Pi-hole admin password" "FTLCONF_webserver_api_password"; then
+            print_error "A Pi-hole admin password is required in ${PIHOLE_ENV_FILE}"
+            exit 1
+        fi
     fi
     
-    # AirGradient Configuration
-    local _airgradient_enable
-    if [[ "${ENABLE_AIRGRADIENT}" == "Y" ]]; then
-        _airgradient_enable="true"
-    else
-        _airgradient_enable="false"
+    # Grafana only reads its admin password on first start. It is written
+    # here for that first start and removed again by secure_service_stacks.
+    if [[ "${ENABLE_MONITORING}" == "Y" && -z "${GRAFANA_ADMIN_PASSWORD:-}" ]]; then
+        collect_grafana_password
     fi
+    
+    local _pihole_enable="false"
+    [[ "${ENABLE_PIHOLE}" == "Y" ]] && _pihole_enable="true"
+    local _monitoring_enable="false"
+    [[ "${ENABLE_MONITORING}" == "Y" ]] && _monitoring_enable="true"
+    local _shelly_enable="false"
+    [[ "${ENABLE_SHELLY}" == "Y" ]] && _shelly_enable="true"
+    local _airgradient_enable="false"
+    [[ "${ENABLE_AIRGRADIENT}" == "Y" ]] && _airgradient_enable="true"
+    local _starlink_enable="false"
+    [[ "${ENABLE_STARLINK}" == "Y" ]] && _starlink_enable="true"
+    
+    # Generate config.yml using internet-pi's own variable names
+    # (see example.config.yml in the internet-pi repository). Values not set
+    # here fall back to internet-pi's defaults.
+    (umask 077 && cat > "${config_file}" << EOF
+---
+# Death Star Pi configuration for geerlingguy/internet-pi.
+# Generated by deathstar-pi-hole-setup. This file stays on the Pi - keep it
+# private (mode 600). It holds Grafana's first-start password only until
+# Grafana has started; setup.sh/update.sh then remove it.
 
-    # Starlink Configuration
-    local _starlink_enable
-    if [[ "${ENABLE_STARLINK}" == "Y" ]]; then
-        _starlink_enable="true"
-    else
-        _starlink_enable="false"
-    fi
+# Pi-hole
+pihole_enable: ${_pihole_enable}
+pihole_timezone: '${system_timezone}'
+# Not a secret: Docker Compose reads the real value from ~/pi-hole/.env
+pihole_password: '\${PIHOLE_PASSWORD}'
 
-    cat >> "${config_file}" << EOF
-internet_pi_shelly_plug_enable: ${_shelly_enable}
-internet_pi_shelly_plug_hostname: ""
-internet_pi_shelly_plug_username: ""
-internet_pi_shelly_plug_password: ""
+# Internet monitoring (Grafana + Prometheus)
+monitoring_enable: ${_monitoring_enable}
+# First-start only - removed automatically once Grafana has created its database
+monitoring_grafana_admin_password: '${GRAFANA_ADMIN_PASSWORD:-}'
+monitoring_speedtest_interval: 60m
+monitoring_ping_interval: 30s
 
-# AirGradient Configuration
-internet_pi_airgradient_enable: ${_airgradient_enable}
-internet_pi_airgradient_address: ""
+# Shelly plug exporter
+shelly_plug_enable: ${_shelly_enable}
+shelly_plug_hostname: '${SHELLY_HOSTNAME:-}'
+shelly_plug_http_username: '${SHELLY_USERNAME:-}'
+# Not a secret: Docker Compose reads the real value from ~/shelly-plug-prometheus/.env
+shelly_plug_http_password: '\${SHELLY_HTTP_PASSWORD}'
 
-# Starlink Configuration
-internet_pi_starlink_enable: ${_starlink_enable}
-
-# External monitoring (disabled by default)
-internet_pi_external_host_enable: false
-internet_pi_external_host_address: ""
-
-# Speed test configuration (conservative for metered connections)
-internet_pi_speedtest_interval: 60  # minutes between tests
-internet_pi_speedtest_server: ""    # auto-select best server
-
-# Timezone
-internet_pi_timezone: "${system_timezone}"
-
-# Service Configuration
-internet_pi_enable_wifi: false
-
-# Docker Configuration
-docker_enable: true
-docker_users:
-  - ${USER}
+# Other optional exporters (AirGradient needs an airgradient_sensors list -
+# see internet-pi's example.config.yml)
+airgradient_enable: ${_airgradient_enable}
+starlink_enable: ${_starlink_enable}
 EOF
+    )
+    chmod 600 "${config_file}"
+    
+    if [[ "${ENABLE_AIRGRADIENT}" == "Y" ]]; then
+        print_warning "AirGradient needs its sensor list - add airgradient_sensors to ${config_file} before the playbook runs"
+    fi
     
     print_status "Generated Ansible config with proper variable expansion"
     print_debug "Config file location: ${config_file}"
@@ -1760,6 +1761,156 @@ install_padd() {
 # Parameters: None
 # Returns: 0 on success, exits on failure
 #===============================================================================
+#===============================================================================
+# Function: secure_service_stacks
+# Description: After the playbook deploys the stacks, apply
+#              lib/stack_hardening.sh: Pi-hole and Shelly passwords only in
+#              their .env files, Grafana's first-start password removed once
+#              Grafana has started, Pi-hole listening mode "all" (needed for
+#              Tailscale/VPN clients), pihole-exporter bound to localhost, and
+#              pihole_enable: false so later playbook runs leave Pi-hole alone.
+#===============================================================================
+secure_service_stacks() {
+    if is_state_complete "STACK_HARDENING"; then
+        print_status "Service hardening already applied, skipping..."
+        return 0
+    fi
+    
+    print_step "Securing service passwords and settings"
+    
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        echo "[DRY-RUN] Would move passwords into .env files, remove Grafana's first-start password and lock the playbook"
+        set_state "STACK_HARDENING"
+        return 0
+    fi
+    
+    # Shelly's password was collected before the playbook cloned its folder
+    # (the folder must not exist before then), so store it now and restart
+    # the exporter so it picks the password up.
+    local shelly_dir
+    shelly_dir="$(ds_shelly_dir)"
+    if [[ -f "${shelly_dir}/docker-compose.yml" ]] && [[ -n "${SHELLY_HTTP_PASSWORD+set}" ]]; then
+        if ds_env_write "${shelly_dir}" "SHELLY_HTTP_PASSWORD" "${SHELLY_HTTP_PASSWORD}" allow-empty; then
+            (cd "${shelly_dir}" && _dsh_docker compose up -d) || print_warning "Could not restart the Shelly plug exporter"
+        fi
+    fi
+    
+    if ! ds_apply_stack_hardening --wait; then
+        print_error "Service hardening failed - fix the error above and re-run ./setup.sh"
+        exit 1
+    fi
+    
+    set_state "STACK_HARDENING"
+    print_success "Service passwords and settings secured"
+}
+
+#===============================================================================
+# Function: setup_tailscale
+# Description: Optional. Install Tailscale and join this Pi to a tailnet so
+#              it can serve DNS (Pi-hole) and route to the home network for
+#              remote devices. Nothing about the tailnet is stored in this
+#              repository - the subnet is detected from the Pi's own routes.
+#===============================================================================
+setup_tailscale() {
+    if is_state_complete "TAILSCALE_SETUP"; then
+        print_status "Tailscale step already completed, skipping..."
+        return 0
+    fi
+    
+    print_step "Optional: Tailscale (remote access and tailnet DNS)"
+    echo -e "${CYAN}Tailscale lets your devices use this Pi-hole and reach your home network from anywhere.${NC}"
+    echo -e "${CYAN}You need a Tailscale account; you will be shown a login link.${NC}"
+    echo
+    local enable_ts
+    read -r -p "Set up Tailscale on this Pi? (y/N): " enable_ts
+    if [[ "${enable_ts^^}" != "Y" ]]; then
+        print_status "Skipping Tailscale"
+        set_state "TAILSCALE_SETUP"
+        return 0
+    fi
+    
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        echo "[DRY-RUN] Would install Tailscale and run tailscale up"
+        set_state "TAILSCALE_SETUP"
+        return 0
+    fi
+    
+    if ! command_exists tailscale; then
+        print_status "Installing Tailscale from tailscale.com..."
+        curl -fsSL https://tailscale.com/install.sh | sh
+    fi
+    
+    # Detect the LAN interface and subnet from the default route
+    local lan_iface lan_subnet
+    lan_iface=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    lan_subnet=""
+    if [[ -n "${lan_iface}" ]]; then
+        lan_subnet=$(ip -4 route show dev "${lan_iface}" proto kernel scope link 2>/dev/null | awk '{print $1; exit}')
+    fi
+    
+    # --accept-dns=false: this Pi IS the DNS server, so it must not point at itself
+    local -a ts_args=("--accept-dns=false" "--hostname=${DS_NEW_HOSTNAME}")
+    local answer
+    
+    read -r -p "Enable Tailscale SSH (SSH to this Pi using tailnet identity)? (Y/n): " answer
+    [[ "${answer^^}" != "N" ]] && ts_args+=("--ssh")
+    
+    local advertise_routes=""
+    if [[ -n "${lan_subnet}" ]]; then
+        read -r -p "Let tailnet devices reach your home network (${lan_subnet}) through this Pi? (Y/n): " answer
+        [[ "${answer^^}" != "N" ]] && advertise_routes="${lan_subnet}"
+    fi
+    [[ -n "${advertise_routes}" ]] && ts_args+=("--advertise-routes=${advertise_routes}")
+    
+    local exit_node="false"
+    read -r -p "Offer this Pi as an exit node (route all internet traffic through home on request)? (y/N): " answer
+    if [[ "${answer^^}" == "Y" ]]; then
+        exit_node="true"
+        ts_args+=("--advertise-exit-node")
+    fi
+    
+    if [[ -n "${advertise_routes}" || "${exit_node}" == "true" ]]; then
+        print_status "Enabling IP forwarding for subnet routing / exit node..."
+        printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' | sudo tee /etc/sysctl.d/99-tailscale.conf >/dev/null
+        sudo sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null
+    fi
+    
+    # tailscale up for a new node; tailscale set when already logged in
+    if sudo tailscale status >/dev/null 2>&1; then
+        print_status "Tailscale already connected - updating its settings..."
+        sudo tailscale set "${ts_args[@]}"
+    else
+        print_status "Starting Tailscale - open the login link it prints to add this Pi to your tailnet"
+        sudo tailscale up "${ts_args[@]}"
+    fi
+    sudo tailscale set --auto-update >/dev/null 2>&1 || true
+    
+    # Allow tailnet traffic through UFW if the firewall is active
+    if command_exists ufw && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+        sudo ufw allow in on tailscale0 >/dev/null
+        sudo ufw allow 41641/udp >/dev/null
+        print_status "Added UFW rules for Tailscale"
+    fi
+    
+    local ts_ip
+    ts_ip=$(tailscale ip -4 2>/dev/null | head -n 1 || true)
+    print_success "Tailscale is up${ts_ip:+ (tailnet address ${ts_ip})}"
+    echo
+    echo -e "${CYAN}Finish in the Tailscale admin console (https://login.tailscale.com/admin):${NC}"
+    echo -e "  1. Machines -> ${DS_NEW_HOSTNAME} -> Disable key expiry (or tag it, e.g. tag:server)"
+    if [[ -n "${advertise_routes}" || "${exit_node}" == "true" ]]; then
+        echo -e "  2. Machines -> ${DS_NEW_HOSTNAME} -> Edit route settings -> approve the subnet / exit node"
+    fi
+    echo -e "  3. DNS -> Nameservers -> Add nameserver -> Custom: ${ts_ip:-<the Pi 100.x address>}, then turn on Override DNS servers"
+    echo -e "  4. DNS -> Search domains -> add ${DS_DOMAIN_NAME} so short names resolve on every device"
+    if [[ "${exit_node}" == "true" ]]; then
+        echo -e "  5. Access controls -> allow autogroup:internet so devices may use the exit node"
+    fi
+    echo
+    
+    set_state "TAILSCALE_SETUP"
+}
+
 harden_pi_security() {
     if is_state_complete "HARDENING"; then
         print_status "Pi security hardening already applied, skipping..."
@@ -1808,9 +1959,16 @@ harden_pi_security() {
         # shellcheck disable=SC1090
         source "${CONFIG_FILE}"
         if [[ "${ENABLE_MONITORING^^}" == "Y" ]]; then
-            ${SUDO} ufw allow 3000/tcp
+            ${SUDO} ufw allow "${DS_GRAFANA_PORT}/tcp"
             print_status "Added firewall rule for Grafana monitoring"
         fi
+    fi
+    # Keep Tailscale working if it is already installed (the reset above
+    # removes any earlier rules)
+    if command_exists tailscale; then
+        ${SUDO} ufw allow in on tailscale0
+        ${SUDO} ufw allow 41641/udp
+        print_status "Added firewall rules for Tailscale"
     fi
     echo "y" | ${SUDO} ufw --force enable
     
@@ -2090,13 +2248,15 @@ console.print(panel)
         echo -e "  ${GREEN}✓${NC} Pi-hole ad blocking"
         echo -e "    └ Web interface: ${BLUE}http://${DS_NEW_HOSTNAME}/admin${NC}"
         echo -e "    └ Alternative: ${BLUE}http://${pi_ip}/admin${NC}"
-        echo -e "    └ Password: ${YELLOW}${PIHOLE_PASSWORD}${NC}"
+        echo -e "    └ Password: stored in ${YELLOW}${PIHOLE_ENV_FILE}${NC} (show it with: grep PIHOLE_PASSWORD ${PIHOLE_ENV_FILE})"
     fi
     
     if [[ "${ENABLE_MONITORING}" == "Y" ]]; then
         echo -e "  ${GREEN}✓${NC} Internet monitoring"
         echo -e "    └ Grafana: ${BLUE}http://${DS_NEW_HOSTNAME}:${DS_GRAFANA_PORT}${NC}"
         echo -e "    └ Alternative: ${BLUE}http://${pi_ip}:${DS_GRAFANA_PORT}${NC}"
+        echo -e "    └ Grafana login: admin / the password you chose (not stored on disk)"
+        echo -e "    └ Forgot it? ${YELLOW}docker exec -it ${GRAFANA_CONTAINER} grafana cli admin reset-admin-password 'NewPassword'${NC}"
         echo -e "    └ Prometheus: ${BLUE}http://${DS_NEW_HOSTNAME}:${DS_PROMETHEUS_PORT}${NC}"
         echo -e "    └ Alternative: ${BLUE}http://${pi_ip}:${DS_PROMETHEUS_PORT}${NC}"
     fi
@@ -2228,6 +2388,10 @@ main() {
         deploy_containers
     fi
     
+    if ! is_state_complete "STACK_HARDENING"; then
+        secure_service_stacks
+    fi
+    
     if ! is_state_complete "PADD_INSTALL"; then
         install_padd
     fi
@@ -2239,6 +2403,10 @@ main() {
     
     if ! is_state_complete "HARDENING"; then
         harden_pi_security
+    fi
+    
+    if ! is_state_complete "TAILSCALE_SETUP"; then
+        setup_tailscale
     fi
     
     if ! is_state_complete "CLEANUP"; then

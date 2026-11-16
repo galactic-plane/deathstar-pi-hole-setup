@@ -35,6 +35,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/log_handler.sh"
 # shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/lib/config_loader.sh"
 
+# Load stack hardening helpers (passwords in .env files, Pi-hole settings,
+# Grafana first-start password cleanup, playbook lock)
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/lib/stack_hardening.sh"
+
 # Initialize logging for this script
 log_init "update"
 
@@ -153,6 +158,12 @@ CONFIG_DIR="${DS_CONFIG_DIR}"
 INTERNET_PI_DIR="${DS_INTERNET_PI_DIR}"
 # shellcheck disable=SC2154  # DS_NEW_HOSTNAME is defined in sourced config_loader.sh
 NEW_HOSTNAME="${DS_NEW_HOSTNAME}"
+# shellcheck disable=SC2154  # DS_GRAFANA_PORT/DS_PROMETHEUS_PORT come from config_loader.sh
+GRAFANA_PORT="${DS_GRAFANA_PORT:-3030}"
+# shellcheck disable=SC2154
+PROMETHEUS_PORT="${DS_PROMETHEUS_PORT:-9090}"
+# Ansible is installed by setup.sh into this virtual environment
+ANSIBLE_VENV="${HOME}/.local/venv-ansible"
 REBOOT_REQUIRED=false
 
 # Hardware detection (with better error handling)
@@ -363,9 +374,11 @@ update_service() {
 cleanup_docker() {
     print_status "🧹 Cleaning up unused Docker resources..."
     
-    # Remove unused images
-    if docker system prune --all -f; then
-        print_success "✅ Cleaned up unused Docker resources"
+    # Remove unused images only. (docker system prune would also delete any
+    # stopped containers and unused networks, including ones you stopped on
+    # purpose.)
+    if docker image prune --all -f; then
+        print_success "✅ Cleaned up unused Docker images"
     else
         print_warning "⚠️ Some Docker cleanup operations may have failed"
     fi
@@ -477,16 +490,34 @@ update_via_playbook() {
             print_warning "⚠️ Repository update failed, continuing with existing version"
         fi
         
+        # Prefer the Ansible virtual environment created by setup.sh
+        local galaxy_cmd="ansible-galaxy"
+        local playbook_cmd="ansible-playbook"
+        if [[ -x "${ANSIBLE_VENV}/bin/ansible-playbook" ]]; then
+            galaxy_cmd="${ANSIBLE_VENV}/bin/ansible-galaxy"
+            playbook_cmd="${ANSIBLE_VENV}/bin/ansible-playbook"
+        fi
+        
         # Update Ansible collections
         print_status "📚 Updating Ansible collections..."
         if [[ -f "requirements.yml" ]]; then
-            ansible-galaxy collection install -r requirements.yml --upgrade
+            "${galaxy_cmd}" collection install -r requirements.yml --upgrade
         fi
         
-        # Re-run the playbook
+        # Never let the playbook overwrite the hardened Pi-hole compose file
+        if [[ "${PIHOLE_INSTALLED}" == "true" ]]; then
+            ds_lock_internet_pi_pihole
+        fi
+        
+        # Re-run the playbook (setup.sh writes the inventory file)
+        local -a inventory_args=()
+        [[ -f "inventory" ]] && inventory_args=(-i inventory)
         print_status "🚀 Re-running Ansible playbook..."
-        if ansible-playbook main.yml; then
+        if "${playbook_cmd}" "${inventory_args[@]}" main.yml; then
             print_success "✅ Playbook completed successfully"
+            # The playbook re-renders Grafana and Shelly files (with default
+            # passwords and 0644 permissions) - clean them up again
+            ds_apply_stack_hardening --wait || print_warning "⚠️ Some hardening steps need attention (see above)"
             return 0
         else
             print_error "❌ Playbook failed"
@@ -612,34 +643,30 @@ main() {
     # Update Fastfetch if installed or install if not present
     update_fastfetch
     
-    # Update Ansible if installed (continue even if not found)
+    # Update Ansible (setup.sh installs it in a virtual environment)
     print_status "🔧 Checking Ansible installation..."
-    if command -v ansible >/dev/null 2>&1; then
-        print_status "📦 Updating Ansible..."
-        if pip3 show ansible >/dev/null 2>&1; then
-            # Ansible installed via pip, update it
-            if pip3 install --upgrade ansible >/dev/null 2>&1; then
-                print_success "✅ Ansible updated via pip3"
-                elif pip3 install --break-system-packages --upgrade ansible >/dev/null 2>&1; then
-                print_success "✅ Ansible updated via pip3 (--break-system-packages)"
-            else
-                print_warning "⚠️ Ansible pip update failed, trying apt..."
-                if sudo apt update && sudo apt upgrade -y ansible >/dev/null 2>&1; then
-                    print_success "✅ Ansible updated via apt"
-                else
-                    print_warning "⚠️ Ansible update failed, continuing..."
-                fi
-            fi
+    if [[ -x "${ANSIBLE_VENV}/bin/pip" ]]; then
+        print_status "📦 Updating Ansible in ${ANSIBLE_VENV}..."
+        if "${ANSIBLE_VENV}/bin/pip" install --upgrade ansible "resolvelib>=0.5.3,<1.1.0" >/dev/null 2>&1; then
+            print_success "✅ Ansible updated (virtual environment)"
         else
-            # Ansible installed via apt
-            if sudo apt update && sudo apt upgrade -y ansible >/dev/null 2>&1; then
-                print_success "✅ Ansible updated via apt"
-            else
-                print_warning "⚠️ Ansible update failed, continuing..."
-            fi
+            print_warning "⚠️ Ansible update failed, continuing..."
         fi
+    elif command -v ansible >/dev/null 2>&1; then
+        print_warning "⚠️ Ansible found outside ${ANSIBLE_VENV} - leaving it to apt/pip"
     else
         print_warning "⚠️ Ansible not found - will skip Ansible-related updates"
+    fi
+    
+    # Tailscale is updated by apt (above) or by its own auto-update
+    if command -v tailscale >/dev/null 2>&1; then
+        local ts_version
+        ts_version=$(tailscale version 2>/dev/null | head -n 1 || true)
+        if tailscale status >/dev/null 2>&1; then
+            print_success "✅ Tailscale ${ts_version} is connected"
+        else
+            print_warning "⚠️ Tailscale ${ts_version} is installed but not connected (check: tailscale status)"
+        fi
     fi
     echo
     
@@ -715,9 +742,24 @@ main() {
         # Verify Pi 5 optimizations
         verify_pi5_optimizations
         
+        # Keep passwords out of config files and Pi-hole hardened before the
+        # containers are recreated (safe to run every time; --no-restart
+        # because update_service recreates the containers anyway)
+        if ! ds_apply_stack_hardening --no-restart; then
+            print_warning "⚠️ Some hardening steps need attention (see above) - continuing with the update"
+        fi
+        echo
+        
         # Update Pi-hole
         if [[ "${PIHOLE_INSTALLED}" == "true" ]]; then
             update_service "${CONFIG_DIR}/pi-hole" "Pi-hole"
+            print_status "🔎 Waiting for Pi-hole DNS to answer..."
+            if ds_wait_for_pihole_dns; then
+                print_success "✅ Pi-hole is answering DNS queries"
+            else
+                print_error "❌ Pi-hole is not answering DNS - devices using it (including your tailnet) cannot resolve names"
+                print_status "💡 Check: cd ${CONFIG_DIR}/pi-hole && docker compose logs --tail 50"
+            fi
             echo
         fi
         
@@ -845,8 +887,8 @@ main() {
         echo -e "  🕳️  Pi-hole Admin:  http://${NEW_HOSTNAME}/admin"
     fi
     if [[ "${MONITORING_INSTALLED}" == "true" ]]; then
-        echo -e "  📊 Grafana:        http://${NEW_HOSTNAME}:3030"
-        echo -e "  📈 Prometheus:     http://${NEW_HOSTNAME}:9090"
+        echo -e "  📊 Grafana:        http://${NEW_HOSTNAME}:${GRAFANA_PORT}"
+        echo -e "  📈 Prometheus:     http://${NEW_HOSTNAME}:${PROMETHEUS_PORT}"
     fi
     echo
     echo -e "${GREEN}Alternative access via IP:${NC}"
@@ -854,13 +896,13 @@ main() {
         echo -e "  🕳️  Pi-hole Admin:  http://${PI_IP}/admin"
     fi
     if [[ "${MONITORING_INSTALLED}" == "true" ]]; then
-        echo -e "  📊 Grafana:        http://${PI_IP}:3030"
-        echo -e "  📈 Prometheus:     http://${PI_IP}:9090"
+        echo -e "  📊 Grafana:        http://${PI_IP}:${GRAFANA_PORT}"
+        echo -e "  📈 Prometheus:     http://${PI_IP}:${PROMETHEUS_PORT}"
     fi
     echo
     echo -e "${BLUE}📊 Updated Components:${NC}"
     echo -e "  • System packages (apt update/upgrade)"
-    echo -e "  • Ansible (latest version)"
+    echo -e "  • Ansible (latest version, in its virtual environment)"
     if [[ "${PI5_DETECTED}" == "true" ]]; then
         echo -e "  • Raspberry Pi 5 optimizations verified"
     fi

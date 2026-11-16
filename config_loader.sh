@@ -18,6 +18,39 @@
 # Global configuration file path
 CONFIG_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.json"
 
+# Optional private overrides (git-ignored). Copy .env.example to .env and set
+# your Pi's address and user there instead of editing the public config.json.
+LOCAL_ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.env"
+
+#===============================================================================
+# Function: load_local_overrides
+# Description: Read DEATHSTAR_PI_HOST / DEATHSTAR_PI_USER from the git-ignored
+#              .env file next to config.json (parsed, never sourced/executed).
+# Exports: PI_IP (when DEATHSTAR_PI_HOST is set), DEATHSTAR_PI_USER
+#===============================================================================
+load_local_overrides() {
+    [[ -f "${LOCAL_ENV_FILE}" ]] || return 0
+    local line key value
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        [[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "${line}" == *=* ]] || continue
+        key="${line%%=*}"
+        key="${key//[[:space:]]/}"
+        value="${line#*=}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ ${#value} -ge 2 ]] && { [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]] || [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; }; then
+            value="${value:1:${#value}-2}"
+        fi
+        case "${key}" in
+            DEATHSTAR_PI_HOST) [[ -n "${value}" ]] && export PI_IP="${value}" ;;
+            DEATHSTAR_PI_USER) export DEATHSTAR_PI_USER="${value}" ;;
+            *) ;;
+        esac
+    done < "${LOCAL_ENV_FILE}"
+}
+
 #===============================================================================
 # Function: check_jq_available
 # Description: Checks if jq is available for JSON parsing
@@ -106,6 +139,7 @@ load_network_config() {
         export PI_IP="192.168.122.159"
         export SSH_TIMEOUT="5"
         export RETRY_ATTEMPTS="3"
+        load_local_overrides
         return 1
     fi
     
@@ -125,6 +159,9 @@ load_network_config() {
     local max_wait_time
     max_wait_time=$(load_config '.network.connection.max_wait_time' '30')
     export MAX_WAIT_TIME="${max_wait_time}"
+    
+    # Private overrides from .env win over the public config.json
+    load_local_overrides
 }
 
 # Load directory configuration with user substitution

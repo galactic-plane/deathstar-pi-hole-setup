@@ -1024,7 +1024,10 @@ perform_final_cleanup() {
     [[ -f "${INTERNET_PI_DIR}/config.yml" ]] && rm -f "${INTERNET_PI_DIR}/config.yml"
     
     # Remove leftover Docker Compose files
-    find "${CONFIG_DIR}" -name "docker-compose.yml" -path "*/{pi-hole,internet-monitoring,shelly-plug-prometheus,starlink-exporter,airgradient-prometheus}" -delete 2>/dev/null || true
+    local stack
+    for stack in pi-hole internet-monitoring shelly-plug-prometheus starlink-exporter airgradient-prometheus; do
+        rm -f "${CONFIG_DIR}/${stack}/docker-compose.yml" "${CONFIG_DIR}/${stack}/.env" 2>/dev/null || true
+    done
     
     # Clean up empty Repo directory
     REPO_BASE="${DS_REPO_BASE:-${HOME}/Repo}"
@@ -1162,7 +1165,8 @@ remove_service() {
         print_status "🛑 Stopping and removing ${service_name}..."
         cd "${service_dir}" || {
             print_warning "⚠️ Cannot access ${service_dir}, trying to remove anyway"
-            if rm -rf "${service_dir}" 2>/dev/null; then
+            # Container-created files (e.g. etc-pihole) are owned by root
+            if rm -rf "${service_dir}" 2>/dev/null || sudo rm -rf "${service_dir}"; then
                 print_success "✅ Removed ${service_name} directory"
             else
                 print_warning "⚠️ Could not remove ${service_name} directory"
@@ -1179,7 +1183,8 @@ remove_service() {
         
         # Remove the directory
         cd "${HOME}" || cd /
-        if rm -rf "${service_dir}" 2>/dev/null; then
+        # Container-created files (e.g. etc-pihole) are owned by root
+        if rm -rf "${service_dir}" 2>/dev/null || sudo rm -rf "${service_dir}"; then
             print_success "✅ Removed ${service_name} directory: ${service_dir}"
         else
             print_warning "⚠️ Could not remove ${service_name} directory"

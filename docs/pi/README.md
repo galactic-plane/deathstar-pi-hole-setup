@@ -206,13 +206,23 @@ STATES=(
 ### Configuration Options
 
 #### Pi-hole Settings
-- **Admin Password**: Generated automatically or user-specified
+- **Admin Password**: Generated automatically or user-specified, stored only in
+  `~/pi-hole/.env` (mode 600). `docker-compose.yml` reads it as `${PIHOLE_PASSWORD}`.
+- **DNS Listening Mode**: Set to `all` after deploy so VPN/Tailscale clients are answered
+- **Playbook Lock**: `pihole_enable: false` is written to internet-pi's `config.yml`
+  after the first deploy so later playbook runs cannot overwrite the Pi-hole compose file
 - **Blocklists**: Curated list of ad/malware blocking lists
 - **DNS Servers**: Configurable upstream DNS providers
 - **Web Interface**: Accessible on port 80
 
 #### Monitoring Settings
-- **Grafana**: Port 3000, admin user auto-configured
+- **Grafana**: Port 3030. The admin password you choose (or a random one) is only
+  used for Grafana's first start; afterwards Grafana keeps a hashed copy and the
+  plain-text copies are deleted. Reset it with
+  `docker exec -it internet-monitoring-grafana-1 grafana cli admin reset-admin-password 'NewPassword'`
+- **Shelly plug** (optional): hostname and username in `config.yml`; the HTTP
+  password lives only in `~/shelly-plug-prometheus/.env`
+- **Ping checks**: Every 30 seconds (`monitoring_ping_interval: 30s`)
 - **Prometheus**: Port 9090, metrics retention configurable
 - **Node Exporter**: Port 9100, system metrics enabled
 
@@ -413,16 +423,24 @@ Intelligent update management script that safely updates all Death Star Pi compo
 
 #### 🐳 Service Updates
 1. **Docker Container Updates**
+   - Docker Compose method (recommended) updates each stack in place and only
+     prunes unused images afterwards (stopped containers are left alone)
+   - Ansible Playbook method uses setup.sh's Ansible virtual environment and
+     inventory, and never touches the Pi-hole stack
    - Pulls latest container images
    - Safely restarts containers with new versions
    - Preserves data volumes and configurations
    - Validates container functionality after updates
 
 2. **Pi-hole Updates**
-   - Updates Pi-hole core components
-   - Updates blocklists and domain databases
-   - Preserves custom configurations and whitelists
-   - Validates DNS functionality after updates
+   - Re-checks the hardened layout first (passwords in `.env` files, Grafana's
+     first-start password removed, listening mode `all`, no DHCP port,
+     pihole-exporter bound to localhost, playbook lock) and fixes any drift.
+     On older installs this moves a plain-text password out of
+     `docker-compose.yml` automatically (a timestamped backup is kept).
+   - Pulls the latest Pi-hole image and recreates the container
+   - Waits until Pi-hole answers DNS again before continuing
+   - Preserves custom configurations, local DNS records and allow/deny lists
 
 3. **Monitoring Stack Updates**
    - Updates Grafana to latest stable version

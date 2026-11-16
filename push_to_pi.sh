@@ -115,7 +115,7 @@ get_pi_config() {
         # Get Pi IP address (require configuration)
         if [[ -z "${PI_IP}" ]]; then
             print_error "❌ Pi IP address not configured!"
-            print_error "Please update config.json with your Pi's IP address in:"
+            print_error "Set DEATHSTAR_PI_HOST in .env (copy .env.example), or update config.json:"
             print_error "  \"network\" -> \"pi\" -> \"default_ip\""
             print_error "Or provide it as a command line argument: $0 username ip-address"
             exit 1
@@ -134,8 +134,13 @@ get_pi_config() {
         
         # Get Pi username
         echo
-        print_status "🤖 What is your Pi username? (e.g., pi, r2-d2, etc.)"
+        if [[ -n "${DEATHSTAR_PI_USER:-}" ]]; then
+            print_status "🤖 What is your Pi username? (current: ${DEATHSTAR_PI_USER} - press Enter to use it)"
+        else
+            print_status "🤖 What is your Pi username? (e.g., pi, r2-d2, etc.)"
+        fi
         read -r PI_USER
+        PI_USER="${PI_USER:-${DEATHSTAR_PI_USER:-}}"
         
         if [[ -z "${PI_USER}" ]]; then
             print_error "❌ Pi username is required!"

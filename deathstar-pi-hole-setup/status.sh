@@ -38,6 +38,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/log_handler.sh"
 # shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/lib/config_loader.sh"
 
+# Load stack hardening helpers (only the read-only checks are used here)
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/lib/stack_hardening.sh"
+
 # Initialize logging for this script
 log_init "status"
 
@@ -118,8 +122,6 @@ rich_check() {
 }
 
 # Configuration variables (from config)
-# shellcheck disable=SC2154  # DS_ variables are defined in config_loader.sh
-DOMAIN_NAME="${DS_DOMAIN_NAME}"
 # shellcheck disable=SC2154  # DS_ variables are defined in config_loader.sh
 NEW_HOSTNAME="${DS_NEW_HOSTNAME}"
 # shellcheck disable=SC2154  # DS_ variables are defined in config_loader.sh
@@ -1060,22 +1062,15 @@ check_configurations() {
     
     # Check config.yml
     if [[ -f "${INTERNET_PI_DIR}/config.yml" ]]; then
-        # Check for Death Star domain configuration
-        if grep -q "${DOMAIN_NAME}" "${INTERNET_PI_DIR}/config.yml"; then
-            print_success "Death Star domain configuration found in config.yml"
+        # Pi-hole is deployed once by the playbook, then managed here
+        # (pihole_enable: false keeps the playbook from overwriting it)
+        if grep -qE "^[[:space:]]*pihole_enable:[[:space:]]*false" "${INTERNET_PI_DIR}/config.yml"; then
+            print_success "Pi-hole is managed by Death Star scripts (playbook will not overwrite it)"
         else
-            print_warning "Death Star domain not configured in config.yml"
-            print_fix "Re-run the Death Star setup script to update configuration"
+            print_status "Pi-hole is still managed by the internet-pi playbook"
         fi
         
-        # Check for enabled services
-        if grep -q "pihole_enable: true" "${INTERNET_PI_DIR}/config.yml"; then
-            print_success "Pi-hole is enabled in configuration"
-        else
-            print_status "Pi-hole is disabled in configuration"
-        fi
-        
-        if grep -q "monitoring_enable: true" "${INTERNET_PI_DIR}/config.yml"; then
+        if grep -qE "^[[:space:]]*monitoring_enable:[[:space:]]*true" "${INTERNET_PI_DIR}/config.yml"; then
             print_success "Monitoring is enabled in configuration"
         else
             print_status "Monitoring is disabled in configuration"
@@ -1102,6 +1097,64 @@ check_configurations() {
         print_fix "Run ./setup.sh to install PADD and create alias"
     fi
     
+    echo
+}
+
+# Function to check password storage, Pi-hole hardening and (optional) Tailscale
+check_security_and_tailscale() {
+    print_separator
+    echo -e "${BLUE}🔐 PASSWORDS, PI-HOLE CONFIGURATION & TAILSCALE${NC}"
+    print_separator
+    
+    ds_check_stack_hardening || true
+    
+    if ! command -v tailscale >/dev/null 2>&1; then
+        print_status "Tailscale not installed (optional - ./setup.sh can set it up)"
+        echo
+        return 0
+    fi
+    
+    if ! tailscale status >/dev/null 2>&1; then
+        print_warning "Tailscale is installed but not connected"
+        print_fix "Check with: tailscale status  (log in again with: sudo tailscale up --accept-dns=false)"
+        echo
+        return 0
+    fi
+    
+    local ts_ip prefs routes
+    ts_ip=$(tailscale ip -4 2>/dev/null | head -n 1)
+    print_success "Tailscale is connected" "${ts_ip}"
+    
+    prefs=$(tailscale debug prefs 2>/dev/null || true)
+    if [[ -n "${prefs}" ]]; then
+        # This Pi is the DNS server, so it must not take DNS from the tailnet
+        if echo "${prefs}" | grep -q '"CorpDNS": true'; then
+            print_warning "Tailscale DNS is enabled on the Pi-hole host - it may point at itself"
+            print_fix "sudo tailscale set --accept-dns=false"
+        else
+            print_success "Tailscale DNS is off on this host (correct for a DNS server)"
+        fi
+        
+        routes=$(echo "${prefs}" | python3 -c 'import json,sys; print(", ".join(json.load(sys.stdin).get("AdvertiseRoutes") or []))' 2>/dev/null || true)
+        if [[ -n "${routes}" ]]; then
+            print_status "Advertised routes: ${routes}"
+            if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]; then
+                print_success "IP forwarding is enabled for subnet routing / exit node"
+            else
+                print_warning "Routes are advertised but IP forwarding is off"
+                print_fix "echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-tailscale.conf && sudo sysctl -p /etc/sysctl.d/99-tailscale.conf"
+            fi
+        fi
+    fi
+    
+    if command -v ufw >/dev/null 2>&1 && sudo -n ufw status 2>/dev/null | grep -q "Status: active"; then
+        if sudo -n ufw status 2>/dev/null | grep -q "tailscale0"; then
+            print_success "UFW allows traffic on tailscale0"
+        else
+            print_warning "UFW is active but has no rule for tailscale0"
+            print_fix "sudo ufw allow in on tailscale0"
+        fi
+    fi
     echo
 }
 
@@ -1267,6 +1320,7 @@ main() {
     
     # Legacy functions still available but streamlined
     check_network_services
+    check_security_and_tailscale
     check_logs
     show_access_info
     show_recommendations

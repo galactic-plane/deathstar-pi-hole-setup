@@ -81,3 +81,8 @@ personal_*
 
 # Status output files
 status_output.log
+
+# Private runtime files from the Pi that must never be committed
+docker-compose.yml.bak.*
+etc-pihole/
+etc-dnsmasq.d/

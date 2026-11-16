@@ -76,7 +76,13 @@ cd deathstar-pi-hole-setup
 
 ### 2. Configure Connection
 
-Edit `config.json` to set your Pi's IP address and user:
+Keep your Pi's address and username out of the public repo by putting them in a
+git-ignored `.env` file:
+```bash
+cp .env.example .env
+# then set DEATHSTAR_PI_HOST (LAN IP, hostname, or Tailscale name) and DEATHSTAR_PI_USER
+```
+Values in `.env` override `config.json`. You can still edit `config.json` instead:
 ```json
 {
   "network": {
@@ -370,6 +376,56 @@ Access monitoring dashboards:
 - **Grafana**: `http://your-pi-ip:3000`
 - **Pi-hole Admin**: `http://your-pi-ip/admin`
 - **Prometheus**: `http://your-pi-ip:9090`
+
+## Secrets and Private Settings
+
+This is a public repository, so nothing about your own network or passwords is
+stored in it. On the Pi, every password is kept out of the config files:
+
+| Service | Where its password lives | Notes |
+|---|---|---|
+| Pi-hole and pihole-exporter | `~/pi-hole/.env` (mode 600) | Compose file reads `${PIHOLE_PASSWORD}` |
+| Grafana | Grafana's own database (hashed) | Used once for first start, then deleted from `config.monitoring` and `config.yml` |
+| Shelly plug exporter | `~/shelly-plug-prometheus/.env` (mode 600) | Compose file reads `${SHELLY_HTTP_PASSWORD}` |
+| Prometheus, node exporter, blackbox, speedtest, AirGradient, Starlink | - | No credentials |
+| Tailscale | Tailscale admin console | Browser login; no key stored on the Pi |
+
+| Other private item | Where it lives | Committed? |
+|---|---|---|
+| internet-pi `config.yml` | `~/Repo/internet-pi/` on the Pi (mode 600, no passwords) | Never |
+| Your Pi's address and username | `.env` in this repo folder (git-ignored, see `.env.example`) | Never |
+
+After the first deploy, the scripts also keep the Pi-hole stack hardened:
+DNS listening mode `all` (so devices on a VPN such as Tailscale can use it), no
+DHCP port, pihole-exporter's port bound to `127.0.0.1` (Prometheus reads it over
+the Docker network), and `pihole_enable: false` in internet-pi's `config.yml` so
+the playbook can never overwrite `~/pi-hole/docker-compose.yml`. The Pi-hole
+scrape job is kept in `prometheus_extra_scrape_configs` so Pi-hole metrics
+survive a playbook run. `./update.sh` re-checks all of this every time it runs,
+and `./status.sh` reports it.
+
+Handy commands on the Pi:
+```bash
+# Show the Pi-hole password
+grep PIHOLE_PASSWORD ~/pi-hole/.env
+
+# Reset the Grafana admin password
+docker exec -it internet-monitoring-grafana-1 grafana cli admin reset-admin-password 'NewPassword'
+```
+
+## Tailscale (Optional)
+
+`./setup.sh` can install Tailscale and join the Pi to your tailnet so your devices
+can use Pi-hole and reach your home network from anywhere. It:
+
+- runs `tailscale up --accept-dns=false` (the Pi *is* the DNS server)
+- optionally enables Tailscale SSH, advertises your home subnet (detected
+  automatically), and offers the Pi as an exit node
+- adds UFW rules for `tailscale0`
+
+Then, in the Tailscale admin console: approve the routes, disable key expiry (or tag
+the Pi), add the Pi's `100.x` address as a custom nameserver with **Override DNS
+servers** on, and add your local domain as a search domain.
 
 ## Security Features
 
