@@ -716,6 +716,16 @@ main() {
         ts_version=$(tailscale version 2>/dev/null | head -n 1 || true)
         if tailscale status >/dev/null 2>&1; then
             print_success "✅ Tailscale ${ts_version} is connected"
+            # Tailscale's recommended UFW rules (UFW denies incoming by default)
+            local ufw_status=""
+            if command -v ufw >/dev/null 2>&1; then
+                ufw_status=$(sudo ufw status 2>/dev/null || true)
+            fi
+            if [[ "${ufw_status}" == *"Status: active"* && "${ufw_status}" != *"tailscale0"* ]]; then
+                if sudo ufw allow in on tailscale0 >/dev/null && sudo ufw allow 41641/udp >/dev/null; then
+                    print_success "✅ Added UFW rules for Tailscale (tailscale0, 41641/udp)"
+                fi
+            fi
         else
             print_warning "⚠️ Tailscale ${ts_version} is installed but not connected (check: tailscale status)"
         fi

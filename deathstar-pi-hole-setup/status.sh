@@ -261,24 +261,26 @@ print_table_row() {
     local health="$3"
     local notes="$4"
     
-    # Color coding for status
+    # Colors are passed to printf with %b so the escape codes are
+    # interpreted; padding is applied to the plain text so columns line up.
+    local status_color="" health_color=""
     case "${status}" in
-        "✅ INSTALLED") status_colored="${GREEN}${status}${NC}" ;;
-        "❌ MISSING") status_colored="${RED}${status}${NC}"; ((CRITICAL_ISSUES++)) ;;
-        "⚠️ PARTIAL") status_colored="${YELLOW}${status}${NC}"; ((ISSUES_FOUND++)) ;;
-        *) status_colored="${status}" ;;
+        "✅ INSTALLED") status_color="${GREEN}" ;;
+        "❌ MISSING") status_color="${RED}"; ((CRITICAL_ISSUES++)) ;;
+        "⚠️ PARTIAL") status_color="${YELLOW}"; ((ISSUES_FOUND++)) ;;
+        *) ;;
     esac
     
-    # Color coding for health
     case "${health}" in
-        "🟢 HEALTHY") health_colored="${GREEN}${health}${NC}" ;;
-        "🔴 UNHEALTHY") health_colored="${RED}${health}${NC}"; ((CRITICAL_ISSUES++)) ;;
-        "🟡 WARNING") health_colored="${YELLOW}${health}${NC}"; ((ISSUES_FOUND++)) ;;
-        "⚫ N/A") health_colored="${NC}${health}${NC}" ;;
-        *) health_colored="${health}" ;;
+        "🟢 HEALTHY") health_color="${GREEN}" ;;
+        "🔴 UNHEALTHY") health_color="${RED}"; ((CRITICAL_ISSUES++)) ;;
+        "🟡 WARNING") health_color="${YELLOW}"; ((ISSUES_FOUND++)) ;;
+        *) ;;
     esac
     
-    printf "%-25s %-12s %-15s %-25s\n" "${component}" "${status_colored}" "${health_colored}" "${notes}"
+    printf "%-25s %b%-12s%b %b%-15s%b %s\n" \
+        "${component}" "${status_color}" "${status}" "${NC}" \
+        "${health_color}" "${health}" "${NC}" "${notes}"
 }
 
 # Function to check comprehensive installation status
