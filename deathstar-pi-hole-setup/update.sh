@@ -220,45 +220,100 @@ check_directory() {
 update_fastfetch() {
     print_status "🔧 Checking/Installing Fastfetch..."
     
-    # Detect architecture (e.g., arm64, armhf, amd64)
-    ARCH=$(dpkg --print-architecture)
+    # Fastfetch release assets are named by CPU, e.g. fastfetch-linux-aarch64.deb
+    local arch github_arch release_json latest_ver current_ver url tmp_deb
+    arch=$(dpkg --print-architecture)
+    case "${arch}" in
+        "arm64") github_arch="aarch64" ;;
+        "armhf") github_arch="armv7l" ;;
+        *) github_arch="${arch}" ;;
+    esac
     
-    # Get latest version tag from GitHub API
-    LATEST_VER_TEMP=$(curl -s https://api.github.com/repos/fastfetch-cli/fastfetch/releases/latest)
-    LATEST_VER_TAG=$(echo "${LATEST_VER_TEMP}" | grep -m1 '"tag_name":' || echo "")
-    LATEST_VER_CUT=$(echo "${LATEST_VER_TAG}" | cut -d '"' -f4 || echo "")
-    LATEST_VER="${LATEST_VER_CUT#v}"
+    if ! release_json=$(curl -s --fail --connect-timeout 10 --max-time 30 \
+        https://api.github.com/repos/fastfetch-cli/fastfetch/releases/latest); then
+        print_warning "⚠️ Could not reach GitHub to check Fastfetch - skipping"
+        return 0
+    fi
+    latest_ver=$(echo "${release_json}" | grep -m1 '"tag_name":' | cut -d '"' -f4 || true)
+    latest_ver="${latest_ver#v}"
     
-    # Get currently installed version (if any)
+    current_ver=""
     if command -v fastfetch >/dev/null 2>&1; then
-        CURRENT_VER_TEMP=$(fastfetch --version 2>/dev/null)
-        CURRENT_VER=$(echo "${CURRENT_VER_TEMP}" | awk '{print $2}')
-    else
-        CURRENT_VER=""
+        current_ver=$(fastfetch --version 2>/dev/null | awk '{print $2}' || true)
     fi
     
-    # Compare versions
-    if [[ "${LATEST_VER}" == "${CURRENT_VER}" ]]; then
-        print_success "✅ Fastfetch is already up to date (version ${CURRENT_VER})"
+    if [[ -n "${latest_ver}" && "${latest_ver}" == "${current_ver}" ]]; then
+        print_success "✅ Fastfetch is already up to date (version ${current_ver})"
         return 0
     fi
     
-    print_status "⬇️ Installing Fastfetch ${LATEST_VER} (current: ${CURRENT_VER:-none})..."
+    url=$(echo "${release_json}" | grep -o "https://[^\"]*linux-${github_arch}\.deb" | head -n 1 || true)
+    if [[ -z "${url}" ]]; then
+        url=$(echo "${release_json}" | grep -o "https://[^\"]*linux-${arch}\.deb" | head -n 1 || true)
+    fi
+    if [[ -z "${url}" ]]; then
+        print_warning "⚠️ No Fastfetch package found for ${arch} - skipping"
+        return 0
+    fi
     
-    # Get download URL for correct architecture
-    URL_TEMP=$(curl -s https://api.github.com/repos/fastfetch-cli/fastfetch/releases/latest)
-    URL_GREP=$(echo "${URL_TEMP}" | grep "browser_download_url.*linux-${ARCH}.deb" || echo "")
-    URL=$(echo "${URL_GREP}" | cut -d '"' -f 4 || echo "")
+    print_status "⬇️ Installing Fastfetch ${latest_ver} (current: ${current_ver:-none})..."
+    # apt only accepts local packages whose name ends in .deb
+    tmp_deb=$(mktemp --suffix=.deb)
+    chmod 644 "${tmp_deb}"
+    if wget -qO "${tmp_deb}" "${url}" && sudo apt install -y "${tmp_deb}"; then
+        print_success "✅ Fastfetch ${latest_ver} installed successfully"
+    else
+        print_warning "⚠️ Fastfetch update failed - keeping version ${current_ver:-none}"
+    fi
+    rm -f "${tmp_deb}"
+    return 0
+}
+
+# Function to update (and if needed rebuild) the Ansible virtual environment.
+# An OS upgrade (e.g. Debian bookworm -> trixie) replaces the Python version
+# the venv was built with, which leaves it broken until it is recreated.
+update_ansible_venv() {
+    local log_file
+    if [[ ! -d "${ANSIBLE_VENV}" ]]; then
+        if command -v ansible >/dev/null 2>&1; then
+            print_warning "⚠️ Ansible found outside ${ANSIBLE_VENV} - leaving it to apt/pip"
+        else
+            print_warning "⚠️ Ansible not found - will skip Ansible-related updates"
+        fi
+        return 0
+    fi
     
-    # Download to a temp file readable by _apt
-    TMP_DEB=$(mktemp)
-    wget -qO "${TMP_DEB}" "${URL}"
+    log_file=$(mktemp)
+    if ! "${ANSIBLE_VENV}/bin/python" -c "import sys" >/dev/null 2>&1; then
+        print_warning "⚠️ Ansible's virtual environment is broken (its Python version is gone, usually after an OS upgrade) - rebuilding it..."
+        if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import venv" >/dev/null 2>&1; then
+            sudo apt install -y python3-venv python3-full >/dev/null 2>&1 || true
+        fi
+        rm -rf "${ANSIBLE_VENV}"
+        if python3 -m venv "${ANSIBLE_VENV}" >>"${log_file}" 2>&1 && \
+           "${ANSIBLE_VENV}/bin/pip" install --upgrade pip >>"${log_file}" 2>&1 && \
+           "${ANSIBLE_VENV}/bin/pip" install "resolvelib>=0.5.3,<1.1.0" ansible >>"${log_file}" 2>&1; then
+            sudo ln -sf "${ANSIBLE_VENV}/bin/ansible" /usr/local/bin/ansible
+            sudo ln -sf "${ANSIBLE_VENV}/bin/ansible-playbook" /usr/local/bin/ansible-playbook
+            sudo ln -sf "${ANSIBLE_VENV}/bin/ansible-galaxy" /usr/local/bin/ansible-galaxy
+            print_success "✅ Ansible virtual environment rebuilt"
+        else
+            print_warning "⚠️ Could not rebuild Ansible's virtual environment. Last output:"
+            tail -n 15 "${log_file}"
+        fi
+        rm -f "${log_file}"
+        return 0
+    fi
     
-    # Install and clean up
-    sudo apt install -y "${TMP_DEB}"
-    rm "${TMP_DEB}"
-    
-    print_success "✅ Fastfetch ${LATEST_VER} installed successfully"
+    print_status "📦 Updating Ansible in ${ANSIBLE_VENV}..."
+    if "${ANSIBLE_VENV}/bin/pip" install --upgrade ansible "resolvelib>=0.5.3,<1.1.0" >"${log_file}" 2>&1; then
+        print_success "✅ Ansible updated (virtual environment)"
+    else
+        print_warning "⚠️ Ansible update failed, continuing. Last output:"
+        tail -n 15 "${log_file}"
+    fi
+    rm -f "${log_file}"
+    return 0
 }
 
 detect_installed_services() {
@@ -645,18 +700,7 @@ main() {
     
     # Update Ansible (setup.sh installs it in a virtual environment)
     print_status "🔧 Checking Ansible installation..."
-    if [[ -x "${ANSIBLE_VENV}/bin/pip" ]]; then
-        print_status "📦 Updating Ansible in ${ANSIBLE_VENV}..."
-        if "${ANSIBLE_VENV}/bin/pip" install --upgrade ansible "resolvelib>=0.5.3,<1.1.0" >/dev/null 2>&1; then
-            print_success "✅ Ansible updated (virtual environment)"
-        else
-            print_warning "⚠️ Ansible update failed, continuing..."
-        fi
-    elif command -v ansible >/dev/null 2>&1; then
-        print_warning "⚠️ Ansible found outside ${ANSIBLE_VENV} - leaving it to apt/pip"
-    else
-        print_warning "⚠️ Ansible not found - will skip Ansible-related updates"
-    fi
+    update_ansible_venv
     
     # Tailscale is updated by apt (above) or by its own auto-update
     if command -v tailscale >/dev/null 2>&1; then

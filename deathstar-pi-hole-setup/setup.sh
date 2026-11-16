@@ -627,7 +627,9 @@ install_fastfetch() {
     print_debug "Download URL: ${URL}"
     
     # Download to a temp file with timeout and error handling
-    TMP_DEB=$(mktemp)
+    # apt only accepts local packages whose name ends in .deb
+    TMP_DEB=$(mktemp --suffix=.deb)
+    chmod 644 "${TMP_DEB}"
     if ! timeout 300 wget --connect-timeout=10 --read-timeout=30 -qO "${TMP_DEB}" "${URL}"; then
         print_warning "Failed to download Fastfetch package, skipping installation"
         log_warning "Fastfetch installation skipped - download failed"

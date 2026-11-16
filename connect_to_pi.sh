@@ -133,6 +133,14 @@ get_pi_config() {
         read -r PI_USER
         PI_USER="${PI_USER:-${DEATHSTAR_PI_USER:-}}"
         
+        # Catch an IP/hostname typed at the username prompt
+        while [[ -n "${PI_USER}" && ! "${PI_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]]; do
+            print_error "❌ '${PI_USER}' doesn't look like a Linux username (e.g. pi, r2-d2)"
+            print_status "🤖 What is your Pi username?${DEATHSTAR_PI_USER:+ (press Enter for ${DEATHSTAR_PI_USER})}"
+            read -r PI_USER
+            PI_USER="${PI_USER:-${DEATHSTAR_PI_USER:-}}"
+        done
+        
         if [[ -z "${PI_USER}" ]]; then
             print_error "❌ Pi username is required!"
             return 1
@@ -438,7 +446,7 @@ setup_ssh_keys_mandatory() {
         chmod 700 ~/.ssh
         
         # Generate new Ed25519 key (more secure and faster than RSA)
-        if ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C "deathstar-pi-$(whoami || true)@$(hostname || true)-$(date +%Y%m%d || true)"; then
+        if ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C "deathstar-pi-$(whoami || true)@${HOSTNAME:-$(uname -n || true)}-$(date +%Y%m%d || true)"; then
             key_file="${HOME}/.ssh/id_ed25519.pub"
             print_success "✅ SSH key generated successfully"
             echo -e "${GREEN}New Ed25519 key created: ~/.ssh/id_ed25519${NC}"
