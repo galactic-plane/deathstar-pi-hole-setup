@@ -270,7 +270,7 @@ update_fastfetch() {
 }
 
 # Function to update (and if needed rebuild) the Ansible virtual environment.
-# An OS upgrade (e.g. Debian bookworm -> trixie) replaces the Python version
+# An OS upgrade (e.g. Debian bookworm -> trixie) changes the Python version
 # the venv was built with, which leaves it broken until it is recreated.
 update_ansible_venv() {
     local log_file
@@ -284,8 +284,11 @@ update_ansible_venv() {
     fi
     
     log_file=$(mktemp)
-    if ! "${ANSIBLE_VENV}/bin/python" -c "import sys" >/dev/null 2>&1; then
-        print_warning "⚠️ Ansible's virtual environment is broken (its Python version is gone, usually after an OS upgrade) - rebuilding it..."
+    # Healthy only if its Python can actually load pip and Ansible. After an OS
+    # upgrade the venv's python may still start but point at a newer Python
+    # whose site-packages folder is empty.
+    if ! "${ANSIBLE_VENV}/bin/python" -c "import pip, ansible" >/dev/null 2>&1; then
+        print_warning "⚠️ Ansible's virtual environment is broken (usually after an OS upgrade changed the Python version) - rebuilding it..."
         if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import venv" >/dev/null 2>&1; then
             sudo apt install -y python3-venv python3-full >/dev/null 2>&1 || true
         fi
