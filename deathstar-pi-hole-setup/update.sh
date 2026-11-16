@@ -237,9 +237,14 @@ update_fastfetch() {
     latest_ver=$(echo "${release_json}" | grep -m1 '"tag_name":' | cut -d '"' -f4 || true)
     latest_ver="${latest_ver#v}"
     
-    current_ver=""
-    if command -v fastfetch >/dev/null 2>&1; then
-        current_ver=$(fastfetch --version 2>/dev/null | awk '{print $2}' || true)
+    # Compare against the apt-installed package (/usr/bin/fastfetch). A copy
+    # installed by hand elsewhere (e.g. /usr/local/bin) would shadow it.
+    local path_bin
+    current_ver=$(dpkg-query -W -f='${Version}' fastfetch 2>/dev/null || true)
+    path_bin=$(command -v fastfetch 2>/dev/null || true)
+    if [[ -n "${path_bin}" && "${path_bin}" != "/usr/bin/fastfetch" ]]; then
+        print_warning "⚠️ An older Fastfetch at ${path_bin} is used instead of the packaged /usr/bin/fastfetch"
+        print_status "💡 Remove it so the updated version is used: sudo rm ${path_bin} && hash -r"
     fi
     
     if [[ -n "${latest_ver}" && "${latest_ver}" == "${current_ver}" ]]; then
